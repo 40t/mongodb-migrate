@@ -5,14 +5,16 @@ import (
 	"gopkg.in/mgo.v2/bson"
 	"fmt"
 	"log"
-	"sync"
-	"math"
 	"strconv"
 	"strings"
+	"sync"
+	"math"
+	"time"
 )
-const FETCH_SOURCE_LIMIT = 4000    //每次拉去数据条数
-const CONCURRENCY_COUNT  = 10      //并发迁移任务数
-const CHUNK_SIZE         = 400     //每次写入条数
+
+const FetchSourceLimit        = 5000      //每次拉去数据条数
+const SplitFetchSourceLimit   = 500       //每个拉取任务一次拉去的数据
+const WorkerCount             = 50        //worker数量
 
 var sourceUrl           string
 var sourceCollectionStr string
@@ -22,9 +24,12 @@ var sourceCollection    *mgo.Collection
 var aimCollection       *mgo.Collection
 
 func main() {
+	now := time.Now().Unix()
 	Welcome()
 	Configure()
 	Migrate()
+	ms := time.Now().Unix() - now
+	fmt.Println("耗时:"+strconv.Itoa(int(ms))+"s")
 }
 
 func Welcome() {
@@ -58,84 +63,94 @@ func Configure()  {
 	aimCollectionStr = strings.TrimSpace(aimCollectionStr)
 	fmt.Println("-------------------------------------------------------------------------------------------------------------------")
 }
-
+//  创建带缓冲的 channel
+var ch = make(chan []interface{}, 1000)
 func Migrate() {
 	_, sourceCollection = initDB(sourceUrl, sourceCollectionStr)
 	_, aimCollection    = initDB(aimUrl, aimCollectionStr)
 
-	var offset = 0
-	var limit  = FETCH_SOURCE_LIMIT
-	var waitGroup sync.WaitGroup
+	//  运行固定数量的 workers
+	for i := 0; i < WorkerCount; i++ {
+		go worker(ch)
+	}
+
+	//  发送任务到 workers
+	var offset int = 0
+	var limit  int = FetchSourceLimit
 	totalResult,_ := sourceCollection.Count()
-	//loop until no result of source's db
-	for{
-		//fetch data
-		var sourceResult []interface{}
-		err := sourceCollection.Find(bson.M{}).Skip(offset).Limit(limit).Sort("_id").All(&sourceResult)
-		if err != nil {
-			log.Fatal("error offset:", offset)
-			break
+	for {
+		var waitGroup sync.WaitGroup
+		offsetRange := splitOffsetRange(offset, limit)
+		for offset, limit := range offsetRange {
+			waitGroup.Add(1)
+			go getTask(offset, limit, &waitGroup)
 		}
-		if len(sourceResult) <= 0 {
-			fmt.Println("已迁移完成")
-			break
-		}
-		fmt.Println(offset,"/",totalResult,"("+strconv.Itoa(int(offset * 100 /totalResult))+"%"+")")
+		waitGroup.Wait()
+
 		offset = offset + limit
+		fmt.Println(offset,"/",totalResult,"("+strconv.Itoa(int(offset * 100 /totalResult))+"%"+")")
 
-		//split data to chunk
-		var chunkSize = CHUNK_SIZE
-		chunk := mapChunk(sourceResult, chunkSize)
-
-		//write data to aim db
-		var pointer = 0
-		var step = CONCURRENCY_COUNT
-		l := len(chunk)
-		for pointer < l {
-			end := 0
-			if (pointer + step) >= l {
-				end = l
-			} else {
-				end = pointer + step
-			}
-			for pointer < end {
-				waitGroup.Add(1)
-				writeAimDB(&waitGroup, chunk[pointer])
-				pointer++
-			}
-			waitGroup.Wait()
-			pointer = end
+		if offset >= totalResult {
+			fmt.Println("已经完成")
+			break
 		}
+	}
+
+}
+
+func splitOffsetRange(offset int, limit int) map[int]int {
+	var result = make(map[int]int)
+	if (FetchSourceLimit <= SplitFetchSourceLimit) {
+		result[offset] = limit
+		return  result
+	}
+
+	var count = float64(FetchSourceLimit / SplitFetchSourceLimit)
+	c := int(math.Floor(count))
+
+	for i := 0; i < c; i++{
+		result[offset + i*SplitFetchSourceLimit] = SplitFetchSourceLimit
+	}
+
+	if SplitFetchSourceLimit * c < FetchSourceLimit {
+		hasFilledCount := SplitFetchSourceLimit * c
+		result[hasFilledCount] = FetchSourceLimit - hasFilledCount
+	}
+
+	return result
+}
+
+func getTask(offset int, limit int, group *sync.WaitGroup) bool {
+	//fetch data
+	var sourceResult []interface{}
+	err := sourceCollection.Find(bson.M{}).Skip(offset).Limit(limit).Sort("_id").All(&sourceResult)
+	if err != nil {
+		log.Fatal("error offset:", offset)
+	}
+	if len(sourceResult) <= 0 {
+		group.Done()
+		return  false
+	}
+	ch <- sourceResult
+	group.Done()
+	return true
+}
+
+func worker(ch chan []interface{}) {
+	for {
+		//接收任务
+		task := <-ch
+		writeAimDB(task)
 	}
 }
 
-func writeAimDB(waitGroup *sync.WaitGroup, data []interface{}) {
+func writeAimDB( data []interface{}) {
 	bulk := aimCollection.Bulk()
 	bulk.Insert(data...)
 	_, err := bulk.Run()
 	if err != nil {
 		log.Print("Error in Insert", err.Error())
 	}
-	waitGroup.Done()
-}
-
-func mapChunk(raw []interface{}, size int) [][]interface{} {
-	var result [][]interface{}
-	mLen := len(raw)
-	count := float64(mLen / size)
-	count = math.Floor(count)
-	c := int(count)
-	if mLen <= size {
-		return append(result, raw)
-	}
-	for i := 0; i < c; i++ {
-		result = append(result,raw[i*size:i*size+size])
-	}
-	if (size * c) < mLen {
-		result = append(result,raw[size * c:])
-	}
-
-	return result
 }
 
 func initDB(url string, c string) (*mgo.Session, *mgo.Collection){
@@ -148,7 +163,7 @@ func initDB(url string, c string) (*mgo.Session, *mgo.Collection){
 	if err != nil {
 		panic(err)
 	}
-	server.SetMode(mgo.Monotonic, true)
+
 	collection := server.DB(dialInfo.Database).C(c)
 
 	return server, collection

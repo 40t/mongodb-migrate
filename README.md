@@ -13,9 +13,9 @@
 |     mongodb://127.0.0.1:27017/test
 |     mongodb://root:Vmjk9B@192.168.100.1:27017/entryDB
 | ]
-| 默认每次拉去条数: 4000
-| 默认并发迁移任务数: 100
-| 默认每个任务写入条数: 400
+| 每次拉去数据条数: 5000
+| 每个拉取任务一次拉去的数据: 500
+| worker数量: 50
 ===================================================================================================================
 (1/4) 请输入数据源URL:
 mongodb://192.168.0.204:27017/userStorage
@@ -31,6 +31,6 @@ userCopy
 ```
 
 ### 修改并发数量:
-    const FETCH_SOURCE_LIMIT = 4000    //从源库每次拉去数据条数
-    const CONCURRENCY_COUNT  = 10      //执行迁移的任务数
-    const CHUNK_SIZE         = 400     //每个任务写入目标库的数据条数
+    const FetchSourceLimit        = 5000      //每次拉去数据条数
+    const SplitFetchSourceLimit   = 500       //每个拉取任务一次拉去的数据
+    const WorkerCount             = 50        //worker数量
